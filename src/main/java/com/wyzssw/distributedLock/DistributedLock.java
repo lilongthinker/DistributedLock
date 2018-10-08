@@ -1,5 +1,6 @@
-
 package com.wyzssw.distributedLock;
+
+import java.util.Collections;
 
 import org.apache.commons.lang3.StringUtils;
 
@@ -7,150 +8,63 @@ import redis.clients.jedis.Jedis;
 
 /**
  * redis实现的distributedlock ,锁占用时间不宜过长
- * @see http://www.jeffkit.info/2011/07/1000/
- * @author wyzssw
+ *
+ * @author lilong
+ * @see //参考 https://www.cnblogs.com/linjiqin/p/8003838.html
  */
 public class DistributedLock {
-    private String host;
-    
-    private Integer port;
-    
-    //单位毫秒
-    private long lockTimeOut;
-    
-    
-    /**
-     * @return the lockTimeOut
-     */
-    public long getLockTimeOut() {
-        return lockTimeOut;
-    }
 
-    private long perSleep;
-    
-    /**
-     * 得不到锁立即返回，得到锁返回设置的超时时间
-     * @param key
-     * @return
-     */
-    public long tryLock(String key){
-        //得到锁后设置的过期时间，未得到锁返回0
-        long expireTime = 0;
-        Jedis jedis = null;
-        jedis = new Jedis(host, port);
-        expireTime = System.currentTimeMillis() + lockTimeOut +1;
-        if (jedis.setnx(key, String.valueOf(expireTime)) == 1) {
-            //得到了锁返回
-            return expireTime;
-        }else  {
-           String curLockTimeStr =  jedis.get(key);
-           //判断是否过期
-            if (StringUtils.isBlank(curLockTimeStr)
-                || System.currentTimeMillis() > Long.valueOf(curLockTimeStr)) {
-                expireTime = System.currentTimeMillis() + lockTimeOut +1;
-                
-                curLockTimeStr = jedis.getSet(key, String.valueOf(expireTime));
-                //仍然过期,则得到锁
-                if (StringUtils.isBlank(curLockTimeStr)
-                        || System.currentTimeMillis() > Long.valueOf(curLockTimeStr)){
-                    return expireTime;
-                }else {
-                    return 0;
-                }
-            }else {
-                return 0;
-            }
-        }
-    }
-    
-    /**
-     * 得到锁返回设置的超时时间，得不到锁等待
-     * @param key
-     * @return
-     * @throws InterruptedException
-     */
-    public long lock(String key) throws InterruptedException{
-        long starttime = System.currentTimeMillis();
-        long sleep = (perSleep==0?lockTimeOut/10:perSleep);
-        //得到锁后设置的过期时间，未得到锁返回0
-        long expireTime = 0;
-        Jedis jedis = new Jedis(host, port);
-        for (;;) {
-        expireTime = System.currentTimeMillis() + lockTimeOut +1;
-        if (jedis.setnx(key, String.valueOf(expireTime)) == 1) {
-            //得到了锁返回
-            return expireTime;
-        }else  {
-           String curLockTimeStr =  jedis.get(key);
-           //判断是否过期
-            if (StringUtils.isBlank(curLockTimeStr)
-                || System.currentTimeMillis() > Long.valueOf(curLockTimeStr)) {
-                expireTime = System.currentTimeMillis() + lockTimeOut +1;
-                
-                curLockTimeStr = jedis.getSet(key, String.valueOf(expireTime));
-                //仍然过期,则得到锁
-                if (StringUtils.isBlank(curLockTimeStr)
-                        || System.currentTimeMillis() > Long.valueOf(curLockTimeStr)){
-                    return expireTime;
-                }else {
-                    Thread.sleep(sleep);
-                }
-            }else {
-                Thread.sleep(sleep);
-            }
-        }
-		if (lockTimeOut > 0
-					&& ((System.currentTimeMillis() - starttime) >= lockTimeOut)) {
-				expireTime = 0;
-				return expireTime;
-			}             
-        }
-        
-    }
-    
-    /**
-     * 先判断自己运行时间是否超过了锁设置时间，是则不用解锁
-     * @param key
-     * @param expireTime
-     */
-    public void unlock(String key,long expireTime){
-        if (System.currentTimeMillis()-expireTime>0) {
-            return ;
-        }
-        Jedis jedis = new Jedis(host, port);
-        String curLockTimeStr = jedis.get(key);
-        if (StringUtils.isNotBlank(curLockTimeStr)&&Long.valueOf(curLockTimeStr)>System.currentTimeMillis()) {
-            jedis.del(key);
-        }
-    }
-    
+    private static final String LOCK_SUCCESS = "OK";
+    private static final String SET_IF_NOT_EXIST = "NX";
+    private static final String SET_WITH_EXPIRE_TIME = "PX";
 
     /**
-     * @param host the host to set
+     * 尝试获取分布式锁
+     * 参考 https://www.cnblogs.com/linjiqin/p/8003838.html
+     *
+     * 第一个为key，我们使用key来当锁，因为key是唯一的。
+     * 第二个为value，我们传的是requestId，很多童鞋可能不明白，有key作为锁不就够了吗，为什么还要用到value？原因就是我们在上面讲到可靠性时，分布式锁要满足第四个条件解铃还须系铃人，通过给value
+     * 赋值为requestId，我们就知道这把锁是哪个请求加的了，在解锁的时候就可以有依据。requestId可以使用UUID.randomUUID().toString()方法生成。
+     * 第三个为nxxx，这个参数我们填的是NX，意思是SET IF NOT EXIST，即当key不存在时，我们进行set操作；若key已经存在，则不做任何操作；
+     * 第四个为expx，这个参数我们传的是PX，意思是我们要给这个key加一个过期的设置，具体时间由第五个参数决定。
+     * 第五个为time，与第四个参数相呼应，代表key的过期时间。
+     *
+     * @param jedis      Redis客户端
+     * @param lockKey    锁
+     * @param requestId  请求标识
+     * @param expireTime 超期时间
+     * @return 是否获取成功
+     * 执行上面的set()方法就只会导致两种结果：1. 当前没有锁（key不存在），那么就进行加锁操作，并对锁设置个有效期，同时value表示加锁的客户端。2. 已有锁存在，不做任何操作。
      */
-    public void setHost(String host) {
-        this.host = host;
+    public static boolean tryGetDistributedLock(Jedis jedis, String lockKey, String requestId, int expireTime) {
+
+        String result = jedis.set(lockKey, requestId, SET_IF_NOT_EXIST, SET_WITH_EXPIRE_TIME, expireTime);
+
+        if (LOCK_SUCCESS.equals(result)) {
+            return true;
+        }
+        return false;
+
     }
-    
+
+    private static final Long RELEASE_SUCCESS = 1L;
+
     /**
-     * @param port the port to set
+     * 释放分布式锁
+     *
+     * @param jedis     Redis客户端
+     * @param lockKey   锁
+     * @param requestId 请求标识
+     * @return 是否释放成功
      */
-    public void setPort(Integer port) {
-        this.port = port;
+    public static boolean releaseDistributedLock(Jedis jedis, String lockKey, String requestId) {
+        String script
+            = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+        Object result = jedis.eval(script, Collections.singletonList(lockKey), Collections.singletonList(requestId));
+        if (RELEASE_SUCCESS.equals(result)) {
+            return true;
+        }
+        return false;
     }
-    
-    
-    /**
-     * @param lockTimeOut the lockTimeOut to set
-     */
-    public void setLockTimeOut(long lockTimeOut) {
-        this.lockTimeOut = lockTimeOut;
-    }
-    
-    /**
-     * @param perSleep the perSleep to set
-     */
-    public void setPerSleep(long perSleep) {
-        this.perSleep = perSleep;
-    }    
+
 }
